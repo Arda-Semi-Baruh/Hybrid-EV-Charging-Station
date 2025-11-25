@@ -1,0 +1,247 @@
+/*
+ * PROJECT: Autonomous Hybrid (Solar/Wind) EV Charging Station Prototype
+ * VERSION: 1.0 (Proof of Concept)
+ * DESCRIPTION: 
+ * This system integrates a dual-axis solar tracker, RFID authentication 
+ * security, and a simulated power management system for EV charging.
+ * * FEATURES:
+ * 1. Dual-Axis Solar Tracking (LDR based)
+ * 2. RFID Access Control (RC522 Module)
+ * 3. Real-time Status Display (LCD I2C)
+ * 4. Power & Current Simulation (V = I*R logic)
+ * * HARDWARE PINOUT:
+ * - Servo Horizontal: D5
+ * - Servo Vertical:   D6
+ * - RFID SDA(SS):     D10
+ * - RFID RST:         D9
+ * - Relay (Charge):   D4
+ * - LDR Sensors:      A0, A1, A2, A3
+ * - Voltage Sensor:   A4
+ */
+
+#include <SPI.h>
+#include <MFRC522.h>
+#include <Servo.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// --- 1. PIN DEFINITIONS ---
+#define SERVO_HORZ_PIN 5   // Horizontal Axis Servo (PWM)
+#define SERVO_VERT_PIN 6   // Vertical Axis Servo (PWM)
+
+#define LDR_TOP_LEFT     A0 
+#define LDR_TOP_RIGHT    A1 
+#define LDR_BOTTOM_LEFT  A2 
+#define LDR_BOTTOM_RIGHT A3
+
+#define BATTERY_SENSE_PIN A4 // Voltage Divider Input
+#define CHARGE_RELAY_PIN  4  // Relay or MOSFET Gate
+
+#define RFID_SS_PIN  10
+#define RFID_RST_PIN 9
+
+// --- 2. OBJECT INITIALIZATION ---
+Servo servoHorz; 
+Servo servoVert; 
+MFRC522 rfid(RFID_SS_PIN, RFID_RST_PIN);
+LiquidCrystal_I2C lcd(0x27, 16, 2); // Standard I2C Address: 0x27
+
+// --- 3. GLOBAL VARIABLES ---
+// TODO: Replace this with your own card's UID found via Serial Monitor
+byte authorizedUID[4] = {97, 76, 67, 9}; 
+
+// Servo Positions
+int posHorz = 90;
+int posVert = 90;
+int tolerance = 10; // Hysteresis buffer to prevent motor jitter
+
+// System State
+bool isCharging = false;
+unsigned long lastUpdateTimer = 0;
+
+void setup() {
+  Serial.begin(9600);
+  SPI.begin();
+  rfid.PCD_Init(); // Initialize RFID Module
+
+  // Attach Servos
+  servoHorz.attach(SERVO_HORZ_PIN);
+  servoVert.attach(SERVO_VERT_PIN);
+  
+  // Set Initial Position
+  servoHorz.write(posHorz);
+  servoVert.write(posVert);
+
+  // Pin Modes
+  pinMode(CHARGE_RELAY_PIN, OUTPUT);
+  digitalWrite(CHARGE_RELAY_PIN, LOW); // Default: OFF
+
+  // Initialize LCD
+  lcd.init();
+  lcd.backlight();
+  showWelcomeScreen();
+}
+
+void loop() {
+  // 1. Security Access Control
+  checkRFID();
+
+  // 2. Solar Tracking Algorithm
+  // Only track sun if system is active (Optional logic, currently always active)
+  trackSun();
+
+  // 3. Energy Management & Display Update (Every 500ms)
+  if (millis() - lastUpdateTimer > 500) {
+    updateSystemStatus();
+    lastUpdateTimer = millis();
+  }
+  
+  delay(50); // Loop stability delay
+}
+
+// --- CORE FUNCTIONS ---
+
+/**
+ * Reads 4 LDR sensors and adjusts servo positions 
+ * to align solar panels perpendicular to the light source.
+ */
+void trackSun() {
+  int tl = analogRead(LDR_TOP_LEFT);
+  int tr = analogRead(LDR_TOP_RIGHT);
+  int bl = analogRead(LDR_BOTTOM_LEFT);
+  int br = analogRead(LDR_BOTTOM_RIGHT);
+
+  int avgTop = (tl + tr) / 2;
+  int avgBot = (bl + br) / 2;
+  int avgLeft = (tl + bl) / 2;
+  int avgRight = (tr + br) / 2;
+
+  // Vertical Adjustment (Elevation)
+  if (abs(avgTop - avgBot) > tolerance) {
+    if (avgTop < avgBot) {
+      posVert++; // Sun is below
+      if (posVert > 180) posVert = 180;
+    } else {
+      posVert--; // Sun is above
+      if (posVert < 0) posVert = 0;
+    }
+    servoVert.write(posVert);
+  }
+
+  // Horizontal Adjustment (Azimuth)
+  if (abs(avgLeft - avgRight) > tolerance) {
+    if (avgLeft < avgRight) {
+      posHorz++; // Sun is right
+      if (posHorz > 180) posHorz = 180;
+    } else {
+      posHorz--; // Sun is left
+      if (posHorz < 0) posHorz = 0;
+    }
+    servoHorz.write(posHorz);
+  }
+}
+
+/**
+ * Handles RFID authentication. 
+ * Toggles the charging state if an authorized card is detected.
+ */
+void checkRFID() {
+  // Check for new cards
+  if (!rfid.PICC_IsNewCardPresent()) return;
+  if (!rfid.PICC_ReadCardSerial()) return;
+
+  Serial.print("Card Detected UID: ");
+  bool match = true;
+  for (byte i = 0; i < 4; i++) {
+    Serial.print(rfid.uid.uidByte[i]);
+    Serial.print(" ");
+    if (rfid.uid.uidByte[i] != authorizedUID[i]) {
+      match = false;
+    }
+  }
+  Serial.println();
+
+  if (match) {
+    // Authorized: Toggle State
+    isCharging = !isCharging;
+    
+    if (isCharging) {
+      digitalWrite(CHARGE_RELAY_PIN, HIGH); // Enable Charging
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("ID AUTHORIZED");
+      lcd.setCursor(0, 1);
+      lcd.print("CHARGING START..");
+    } else {
+      digitalWrite(CHARGE_RELAY_PIN, LOW); // Disable Charging
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("SESSION ENDED");
+      lcd.setCursor(0, 1);
+      lcd.print("THANK YOU");
+    }
+    delay(2000); // Visual delay for user
+  } else {
+    // Unauthorized
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("ACCESS DENIED");
+    lcd.setCursor(0, 1);
+    lcd.print("INVALID CARD");
+    delay(2000);
+  }
+
+  rfid.PICC_HaltA(); 
+  rfid.PCD_StopCrypto1();
+}
+
+/**
+ * Simulates power calculations (Voltage, Current, Power) 
+ * and updates the LCD interface.
+ */
+void updateSystemStatus() {
+  // Read Voltage (Voltage Divider Logic: 0-5V input maps to 0-25V battery)
+  int sensorValue = analogRead(BATTERY_SENSE_PIN);
+  float voltage = sensorValue * (25.0 / 1023.0);
+  
+  // SIMULATION MODE: If no battery is connected, generate realistic demo values
+  if (voltage < 1.0) {
+    // Fluctuate voltage between 12.0V and 13.0V for realism
+    voltage = 12.0 + ((float)random(0, 100) / 100.0);
+  }
+
+  if (isCharging) {
+    // Calculate Virtual Current & Power (Ohm's Law Simulation)
+    // Assuming a load resistance of ~5 Ohms
+    float resistance = 5.0; 
+    float current = voltage / resistance; 
+    float power = voltage * current;
+
+    lcd.setCursor(0, 0);
+    lcd.print("PWR: ");
+    lcd.print(power, 1);
+    lcd.print("W       "); // Padding spaces
+
+    lcd.setCursor(0, 1);
+    lcd.print("V:");
+    lcd.print(voltage, 1);
+    lcd.print(" I:");
+    lcd.print(current, 1);
+    lcd.print("A");
+  } else {
+    // Standby Screen
+    lcd.setCursor(0, 0);
+    lcd.print("STATUS: STANDBY ");
+    lcd.setCursor(0, 1);
+    lcd.print("SCAN CARD...    ");
+  }
+}
+
+void showWelcomeScreen() {
+  lcd.setCursor(0, 0);
+  lcd.print("HYBRID EV CHARGE");
+  lcd.setCursor(0, 1);
+  lcd.print("SYSTEM V1.0     ");
+  delay(2000);
+  lcd.clear();
+}
